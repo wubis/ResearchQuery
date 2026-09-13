@@ -8,6 +8,8 @@
 
 Before changing this repository, read this document in full. If code and this document disagree, stop and determine whether the code is an intentional, recorded architectural change. Update the relevant ADR and this document in the same change; do not silently let the design drift.
 
+When instructions conflict, use this order: the current explicit task scope; the invariants and accepted ADRs in this document; the active phase contracts/defaults; then implementation-status recommendations. A task that intentionally changes an invariant or accepted decision must say so explicitly and update the ADR/design in the same change.
+
 ## 1. Product goal and success criterion
 
 ResearchQuery helps Johns Hopkins students find current Hopkins faculty whose research aligns with the students' natural-language interests, desired methods, coursework, skills, and academic background. It returns faculty together with the actual Hopkins or scholarly research documents that caused each result to rank.
@@ -146,6 +148,19 @@ flowchart TD
 
 The MVP is one Python package, one PostgreSQL database with pgvector, command-line ingestion/evaluation scripts, and one Streamlit process. Embeddings run offline during ingestion and once per query during search. CPU execution is the baseline. No service boundary is introduced merely in anticipation of a future web product.
 
+### 3.4 Provisional non-functional budgets
+
+These are engineering guardrails, not claims about production scale:
+
+- On documented commodity CPU hardware with a warm embedding model and local database, target p95 search latency of at most 2 seconds for the default top-10 response. Record embedding and database/fusion latency separately.
+- Cold model load is measured separately and may exceed the warm budget; the demo loads one model once per process rather than per request.
+- Cap built query text at 8,000 UTF-8 characters as an abuse guard and at the active encoder's safe query-token budget (480 BGE tokens by default, leaving room for its instruction/special tokens). Reject and ask the user to shorten input rather than silently truncating query intent. Retrieval limits are bounded by typed configuration.
+- A successful result contains at least one source-linked evidence document per returned faculty. Never return an evidence-free faculty merely to fill top K.
+- One source ingestion run per `source_name` may execute at a time. Runs are retryable and idempotent; partial runs never cause absence-based deactivation.
+- Core search remains usable on CPU without an external inference service. No production availability/SLA is claimed for the MVP demo.
+
+Revisit these budgets after the real Whiting corpus is measured; record changes as configuration/operational decisions, not silent assumptions.
+
 ## 4. Repository shape
 
 Create files only when their phase or task is active. The intended compact layout is:
@@ -211,7 +226,15 @@ Use typed Python data classes or equivalent validation models at module boundari
 
 ```python
 from dataclasses import dataclass, field
-from typing import Iterable, Mapping, Protocol
+from datetime import datetime
+from typing import Mapping, Protocol
+
+@dataclass(frozen=True)
+class RawAffiliation:
+    school: str
+    department: str | None = None
+    title: str | None = None
+    source_url: str | None = None
 
 @dataclass(frozen=True)
 class RawFacultyRecord:
@@ -220,27 +243,47 @@ class RawFacultyRecord:
     source_url: str
     name: str
     title: str | None = None
-    school: str | None = None
-    department: str | None = None
+    affiliations: tuple[RawAffiliation, ...] = ()
     profile_url: str | None = None
     lab_url: str | None = None
     research_areas: tuple[str, ...] = ()
     research_summary: str | None = None
     biography: str | None = None
+    source_role_category: str | None = None
+    eligibility_evidence: tuple[str, ...] = ()
     external_identifiers: Mapping[str, str] = field(default_factory=dict)
     source_payload: Mapping[str, object] = field(default_factory=dict)
+
+@dataclass(frozen=True)
+class FacultySourceSnapshot:
+    source_name: str
+    snapshot_id: str
+    fetched_at: datetime
+    records: tuple[RawFacultyRecord, ...]
+    membership_complete: bool
+    errors: tuple[str, ...] = ()
 
 class FacultySource(Protocol):
     source_name: str
 
-    def fetch_faculty(self) -> Iterable[RawFacultyRecord]: ...
+    def fetch_faculty(self) -> FacultySourceSnapshot: ...
 ```
 
-`source_faculty_key` is the adapter's most stable identifier: a Hopkins directory ID when available, otherwise a canonicalized Hopkins profile URL. Pagination, individual-page enrichment, selectors, and source-specific retries remain inside the adapter. The adapter emits records; it does not write canonical faculty, resolve scholarly authors, build embeddings, or know about retrieval.
+`source_faculty_key` is the adapter's most stable identifier: a Hopkins directory ID when available, otherwise a canonicalized Hopkins profile URL. Emit every affiliation explicitly present on the source record; an authoritative school adapter supplies at least its own school even when department is unavailable. `membership_complete=true` means the adapter successfully enumerated the entire authoritative membership listing for that snapshot; it does **not** require every optional profile enrichment request to succeed. Only such a snapshot may increment absence counters or deactivate missing source records. Pagination, individual-page enrichment, selectors, and source-specific retries remain inside the adapter. The adapter emits a snapshot; it does not write canonical faculty, resolve scholarly authors, build embeddings, or know about retrieval.
 
 ### 5.2 Publication source contract
 
 ```python
+@dataclass(frozen=True)
+class FacultyForResolution:
+    faculty_id: UUID
+    name: str
+    titles: tuple[str, ...]
+    affiliations: tuple[str, ...]
+    research_text: str
+    known_publication_titles: tuple[str, ...]
+    external_identifiers: Mapping[str, str]
+
 @dataclass(frozen=True)
 class AuthorCandidate:
     source_name: str
@@ -249,6 +292,13 @@ class AuthorCandidate:
     affiliations: tuple[str, ...]
     topics: tuple[str, ...]
     known_papers: tuple["PublicationRecord", ...]
+
+@dataclass(frozen=True)
+class AuthorCandidateBatch:
+    candidates: tuple[AuthorCandidate, ...]
+    fetched_at: datetime
+    complete_for_request: bool
+    errors: tuple[str, ...] = ()
 
 @dataclass(frozen=True)
 class PublicationRecord:
@@ -263,16 +313,23 @@ class PublicationRecord:
     authors: tuple[str, ...]
     metadata: Mapping[str, object]
 
+@dataclass(frozen=True)
+class PublicationBatch:
+    records: tuple[PublicationRecord, ...]
+    fetched_at: datetime
+    complete_for_request: bool
+    errors: tuple[str, ...] = ()
+
 class PublicationSource(Protocol):
     source_name: str
 
-    def find_authors(self, faculty: "FacultyForResolution") -> list[AuthorCandidate]: ...
+    def find_authors(self, faculty: "FacultyForResolution") -> AuthorCandidateBatch: ...
     def get_publications(
-        self, author_id: str, *, limit: int, start_year: int | None
-    ) -> list[PublicationRecord]: ...
+        self, author_id: str, *, candidate_limit: int, start_year: int | None
+    ) -> PublicationBatch: ...
 ```
 
-Provider responses are mapped to these types at the boundary. The ingestion pipeline owns confidence decisions and persistence. Semantic Scholar is first; OpenAlex may later implement the same interface.
+Provider responses are mapped to these types at the boundary. `complete_for_request` means all pages required by that bounded candidate/publication request were fetched successfully. A failed candidate request preserves the prior resolution state rather than becoming a false `unresolved`; only a complete candidate batch may produce a new resolution decision, and only a complete publication batch may drive publication deactivation. The ingestion pipeline owns confidence decisions and persistence. Semantic Scholar is first; OpenAlex may later implement the same interface.
 
 ### 5.3 Query and result contracts
 
@@ -330,7 +387,8 @@ class RankedDocument:
     document_id: UUID
     faculty_id: UUID
     rank: int
-    score: float
+    native_score: float | None
+    fusion_score: float
     channel: str  # "dense", "sparse", or "hybrid"
     channel_ranks: Mapping[str, int]
 
@@ -368,6 +426,8 @@ return faculty_aggregator.aggregate(
 )
 ```
 
+`native_score` is for channel diagnostics only. `fusion_score` is the rank-space value consumed by aggregation: one reciprocal-rank term for a single-channel result, or their sum for hybrid RRF. No caller may aggregate raw cosine and FTS scores as though they shared a scale.
+
 ## 6. Relational data model
 
 PostgreSQL is the source of truth. Use UUID primary keys, UTC `timestamptz`, JSONB only for provider-specific extras, and database constraints for uniqueness. The logical schema is minimal but separates canonical identity from source observations and affiliations.
@@ -384,9 +444,8 @@ PostgreSQL is the source of truth. Use UUID primary keys, UTC `timestamptz`, JSO
 | `lab_url` | `text null` | Clearly identified lab URL only. |
 | `research_summary` | `text null` | Current Hopkins research statement when available. |
 | `is_active` | `boolean` | Current institutional status; default true. |
-| `external_scholar_author_id` | `text null` | Resolved ID for the configured primary scholarly source. |
-| `author_resolution_status` | enum/text | `unresolved`, `ambiguous`, or `resolved`. |
-| `author_resolution_confidence` | `double precision null` | Stored score for audit, not retrieval. |
+| `eligibility_status` | enum/text | `eligible`, `review`, or `excluded`; search requires `eligible`. |
+| `eligibility_reason` | `text` | Versioned, human-readable policy outcome. |
 | `created_at` | `timestamptz` | First canonical creation. |
 | `updated_at` | `timestamptz` | Last canonical change. |
 
@@ -406,7 +465,7 @@ For convenient display, school and department are derived from active affiliatio
 | `source_record_id` | `uuid` | Provenance link. |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
 
-Unique active identity is enforced on `(faculty_id, school, coalesce(department, ''))`. This table prevents duplicate faculty results while preserving professors listed by multiple Hopkins units.
+Use a partial functional unique index on `(faculty_id, school, COALESCE(department, '')) WHERE is_active` and another partial unique index on `(faculty_id) WHERE is_active AND is_primary`. This table prevents duplicate faculty results while preserving professors listed by multiple Hopkins units. If several source records assert the same affiliation, `source_record_id` points to the highest-precedence active assertion; the other observations remain auditable in `faculty_source_records`.
 
 ### 6.3 `faculty_source_records`
 
@@ -427,7 +486,39 @@ Unique active identity is enforced on `(faculty_id, school, coalesce(department,
 
 `(source_name, source_faculty_key)` is unique. It is the principal upsert key. A canonical faculty may own many source records. Cross-source merging is explicit and auditable; never merge common names on name alone. If an adapter supplies no separate profile URL, normalization uses its authoritative Hopkins `source_url` as the canonical faculty profile URL.
 
-### 6.4 `research_documents`
+### 6.4 `scholarly_author_links`
+
+Author resolution belongs to a faculty/provider pair rather than to the Faculty row. This preserves the provider abstraction and allows Semantic Scholar to be replaced or compared without overloading one global status.
+
+| Column | Type | Rules / purpose |
+|---|---|---|
+| `author_link_id` | `uuid` | Primary key. |
+| `faculty_id` | `uuid` | Canonical Hopkins faculty; indexed foreign key. |
+| `source_name` | `text` | Scholarly provider, initially `semantic_scholar`. |
+| `external_author_id` | `text null` | Populated only for a resolved or explicitly reviewed link. |
+| `resolution_status` | enum/text | `unresolved`, `ambiguous`, or `resolved`. |
+| `confidence` | `double precision null` | Resolver score for audit, never a search feature. |
+| `resolver_version` | `text` | Scoring-policy version or `manual`. |
+| `evidence` | `jsonb` | Candidate IDs, per-signal values, contradictions, margin, and review note. |
+| `validated_at` | `timestamptz null` | Last successful validation of a resolved ID. |
+| `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
+
+`(faculty_id, source_name)` is unique. A partial unique index on `(source_name, external_author_id)` where `resolution_status='resolved'` prevents one scholarly author identity from being silently assigned to two canonical faculty. A legitimate exception requires explicit review and a recorded override rather than weakening the default constraint.
+
+### 6.5 `faculty_redirects`
+
+Manual duplicate merges preserve old stable IDs:
+
+| Column | Type | Rules / purpose |
+|---|---|---|
+| `from_faculty_id` | `uuid` | Primary key; retired canonical ID. |
+| `to_faculty_id` | `uuid` | Surviving canonical ID; must differ from source. |
+| `reason` | `text` | Evidence-backed merge reason. |
+| `created_at` | `timestamptz` | Audit timestamp. |
+
+Redirects may not form cycles. Repository lookups resolve a redirect to its terminal faculty ID; merge transactions repoint owned records and mark the retired Faculty inactive. This table is empty in the common case but makes the promised merge/tombstone behavior implementable.
+
+### 6.6 `research_documents`
 
 | Column | Type | Rules / purpose |
 |---|---|---|
@@ -439,23 +530,38 @@ Unique active identity is enforced on `(faculty_id, school, coalesce(department,
 | `publication_year` | `smallint null` | Publication year where applicable. |
 | `source_url` | `text` | Evidence destination; required. For scholarly records, construct the provider's canonical paper URL from its ID when necessary. |
 | `source_name` | `text` | Hopkins adapter or scholarly provider. |
-| `external_id` | `text` | Stable source-level content identity. |
+| `external_id` | `text` | Stable namespaced canonical content key, as defined in Section 7.2. |
 | `chunk_key` | `text` | `whole` for unsplit content, otherwise stable source-local section/chunk key. |
-| `metadata` | `jsonb` | DOI, authors, venue, affiliation context, content hash, and provider extras. |
+| `content_hash` | `text` | Hash of the full canonical normalized title/body; changes invalidate dependent embeddings. |
+| `metadata` | `jsonb` | DOI, authors, venue, affiliation context, identity aliases, and provider extras. |
 | `search_vector` | `tsvector` | Stored/generated weighted lexical representation. |
-| `embedding` | `vector(768)` | Nullable until embedded; L2-normalized BGE vector. |
-| `embedding_model` | `text null` | Exact model/revision used. |
-| `embedding_content_hash` | `text null` | Hash of formatted embedding input. |
 | `is_active` | `boolean` | Excluded from search when false. |
 | `created_at`, `updated_at` | `timestamptz` | Audit timestamps. |
 
-Unique constraint: `(faculty_id, source_name, external_id, chunk_key)`. There is intentionally no separate Publication table: publication title, abstract text, year, DOI, author list, venue, IDs, and provenance fit cleanly in a `publication` ResearchDocument. Add a Publication table only if later non-retrieval relations require it.
+Use a partial unique index on `(faculty_id, document_type, external_id, chunk_key) WHERE is_active`. Excluding `source_name` prevents the same DOI from becoming duplicate evidence when a scholarly provider changes, while the partial predicate permits an explicitly retired merge duplicate to remain auditable. The selected evidence provider remains in `source_name`/`source_url`, while all observed provider IDs are retained in `metadata.provider_ids`. There is intentionally no separate Publication table: publication title, abstract text, year, DOI, author list, venue, IDs, and provenance fit cleanly in a `publication` ResearchDocument. Add a Publication table only if later non-retrieval relations require it.
 
 The lexical vector weights title as `A` and body text as `B`. Metadata is not broadly indexed; explicitly promote a field only after evaluation shows value.
 
-### 6.5 Optional operational tables
+### 6.7 `document_embeddings` and active index state
 
-`ingestion_runs` is allowed in Phase 1 because safe deactivation and debugging require knowing whether a source snapshot completed. Store run ID, source, start/end, status, counts, configuration, and error summary. `author_resolution_attempts` is also allowed if JSON logs are insufficient; it records candidates, feature evidence, score, decision, and resolver version. Neither participates in search.
+Embedding versions are separate rows so rebuilding or evaluating a model cannot expose a mixed-model index:
+
+| Column | Type | Rules / purpose |
+|---|---|---|
+| `document_id` | `uuid` | Foreign key to ResearchDocument. |
+| `embedding_version` | `text` | Model ID + pinned revision + formatter version. |
+| `embedding` | `vector(768)` | L2-normalized vector. |
+| `document_content_hash` | `text` | Copy of the full ResearchDocument content hash used to detect staleness. |
+| `embedding_input_hash` | `text` | Hash of the exact formatted/token-limited encoder input. |
+| `created_at` | `timestamptz` | Build timestamp. |
+
+Primary key: `(document_id, embedding_version)`. A singleton `search_index_state` stores the active `embedding_version`, activation time, and corpus snapshot ID. Build a candidate version fully, verify every eligible active document has a matching `document_content_hash`, then activate it in one transaction. Dense search joins only the active version and never mixes model revisions. Incremental content updates may temporarily exclude a stale document (`embedding.document_content_hash != document.content_hash`) until its replacement vector is written.
+
+The MVP column is fixed at 768 dimensions. Phase 3 model comparisons should initially use 768-dimensional candidates. Testing a different dimension requires an explicit migration or dimension-specific embedding table; do not store padded or truncated vectors.
+
+### 6.8 Operational tables
+
+`ingestion_runs` is required because safe deactivation and debugging depend on snapshot completeness. Store run ID, source, snapshot ID, start/end, membership-complete flag, status, counts, configuration, and error summary. A lightweight `corpus_snapshots` record identifies the set of completed source runs used for an evaluation or index activation. These tables do not participate in ranking.
 
 ## 7. Stable identity, deduplication, and upserts
 
@@ -465,17 +571,19 @@ The lexical vector weights title as `A` and body text as `B`. Metadata is not br
 - Upsert a source observation by unique `(source_name, source_faculty_key)` and preserve its existing `faculty_id`.
 - On a new source record, first match an exact previously seen canonicalized Hopkins profile URL or explicit Hopkins identifier. Otherwise require a reviewed multi-signal institutional match (normalized name plus compatible unit/title/profile evidence). Name alone never auto-merges.
 - If identity remains uncertain, create a separate canonical record and flag it for possible merge. A false duplicate is safer than merging two people and contaminating publications.
-- A later explicit merge chooses one surviving `faculty_id`, repoints affiliations/source records/documents transactionally, records the alias/tombstone, and preserves external references. Routine ingestion never performs destructive merging.
+- A later explicit merge chooses one surviving `faculty_id`, repoints affiliations/source records/scholarly links/documents transactionally, records the alias/tombstone, and preserves external references. Routine ingestion never performs destructive merging.
+
+For a manual faculty merge, `document_id` is not recomputed merely because its owner changes: UUIDv5 is the creation-time identity rule. Before repointing, detect target-side document-key collisions. For a collision, retain the higher-precedence/current document, merge provider/provenance aliases, and deactivate the duplicate while recording its ID in `metadata.merged_document_ids`; otherwise repoint the document without changing its ID. Consolidate same-provider scholarly links; if the duplicates have conflicting resolved author IDs, abort the merge and require identity review. This exceptional maintenance path is transactional and separately tested.
 
 ### 7.2 Document identity
 
 Generate UUIDv5 `document_id` from the namespace `researchquery-document-v1` and:
 
 ```text
-faculty_id | source_name | external_id | chunk_key
+faculty_id | document_type | external_id | chunk_key
 ```
 
-For Hopkins page sections, `external_id` is an explicit source content ID or canonical URL plus semantic section type. For publications, prefer DOI, then provider paper ID, then `normalized_title|year`. `chunk_key` is `whole` unless the source is split. Changes to title, abstract, or page copy update the same row, invalidate its embedding hash, and do not create a duplicate.
+`external_id` is namespaced. For Hopkins page sections use `hopkins:{source_name}:{source content ID or canonical URL}:{semantic section}`. For publications use `doi:{normalized DOI}` when available, then `{provider}:{paper ID}`, then `title-year:{hash(normalized title|year)}`. During upsert, search all available DOI/provider/title-year aliases before creating a row. Once created, the chosen `external_id` remains immutable; stronger identifiers discovered later go into `metadata.identity_aliases` and match the existing row. `chunk_key` is `whole` unless the source is split. Changes to title, abstract, or page copy update the same row and invalidate its content-hash match without creating a duplicate.
 
 Publication deduplication within one faculty uses DOI first, then provider ID, then normalized title plus year. The same paper may correctly exist once per faculty owner because each document is evidence for a different faculty result.
 
@@ -487,7 +595,7 @@ Publication deduplication within one faculty uses DOI first, then provider ID, t
 - After **two consecutive successful complete snapshots** omit a source record, mark that source record and its source-dependent documents inactive. Mark the canonical faculty inactive only when no active Hopkins source record remains.
 - Reappearance reactivates the existing identities.
 - Scholarly publications missing from a refresh are not immediately deleted; deactivate only after a successful complete author fetch and a configurable grace policy. Policy changes must not change stable document IDs.
-- Preserve old records for audit; normal search always filters `is_active=true` and `embedding is not null` for dense search.
+- Preserve old records for audit. Normal search requires active, eligible Faculty; active documents; the active embedding version; and `document_embeddings.document_content_hash = research_documents.content_hash`.
 
 ## 8. Ingestion architecture and policy
 
@@ -495,7 +603,7 @@ Publication deduplication within one faculty uses DOI first, then provider ID, t
 
 For each enabled source:
 
-1. Start an ingestion run and fetch the directory with respectful rate limits, a descriptive user agent, bounded concurrency, timeouts, retries with jitter, and provider caching.
+1. Acquire a PostgreSQL advisory lock scoped to `source_name`, start an ingestion run, and fetch a `FacultySourceSnapshot` with respectful rate limits, a descriptive user agent, bounded concurrency, timeouts, retries with jitter, and provider caching.
 2. Optionally fetch authoritative individual Hopkins pages discovered by the adapter.
 3. Persist the raw parsed `RawFacultyRecord` and provenance before normalization.
 4. Normalize whitespace, Unicode, names for comparison, canonical URLs, school names, department names, and lists. Preserve the display spelling from Hopkins.
@@ -504,11 +612,27 @@ For each enabled source:
 7. Resolve the scholarly author conservatively. Reuse a persisted resolved ID unless validation indicates drift.
 8. For resolved authors only, fetch and select recent publications, deduplicate them, and build publication documents.
 9. Embed new or changed active documents.
-10. Mark the snapshot complete, apply absence policy, and report counts and errors.
+10. Mark the snapshot complete, apply absence policy only when `membership_complete=true`, report counts/errors, and release the source lock.
 
-Retries should cover transient `429`, `5xx`, and connection failures with exponential backoff and honor `Retry-After`. Permanent record errors are logged with faculty/source context and do not abort unrelated records. Authentication/configuration errors fail the run. Cache scholarly responses during a run and respect provider terms and quotas. Do not aggressively crawl personal sites; lab content is accepted only from clearly linked, publicly accessible pages and remains lower-authority research evidence, not identity evidence.
+Fetch/parse and database application are separate stages: first establish the snapshot's membership completeness, then apply its records idempotently. Checkpointing may preserve successful enrichment work, but no partial run may advance absence counters. Retries should cover transient `429`, `5xx`, and connection failures with exponential backoff and honor `Retry-After`. Permanent record errors are logged with faculty/source context and do not abort unrelated optional enrichments. Authentication/configuration errors fail the run. Cache scholarly responses during a run and respect provider terms and quotas. Do not aggressively crawl personal sites; lab content is accepted only from clearly linked, publicly accessible pages and remains lower-authority research evidence, not identity evidence.
 
-### 8.2 Source precedence and field conflicts
+If a directory pagination or membership-record parse error could hide a person, set `membership_complete=false`. A failed optional profile, lab, or scholarly enrichment may leave membership complete, but it must retain the previous good enrichment and appear in run diagnostics.
+
+### 8.2 Faculty eligibility policy
+
+“Listed on a page” is not precise enough to define the searchable population. Each adapter must version and test a source-specific eligibility policy while preserving the source's original role/category and evidence.
+
+Initial Whiting default:
+
+- Include a current person explicitly identified by an authoritative Whiting/Hopkins source as faculty. Research-document completeness is measured separately and never determines Hopkins membership.
+- Do not use a brittle title whitelist; tenure-track, research, teaching, adjunct, joint, and visiting titles may be eligible when the current Hopkins source and research evidence support inclusion.
+- Exclude students, postdoctoral fellows, staff, administrators with no faculty appointment, and directory entries that are clearly historical.
+- Treat emeritus and ambiguous affiliate appointments as `review` by default unless the Hopkins source clearly indicates a current research role.
+- An adapter/parser does not silently drop review/excluded records. Persist the source record and eligibility evidence, then let the versioned normalization policy set `eligible`, `review`, or `excluded`.
+
+Only active `eligible` Faculty appear in normal search. A faculty member with no usable research documents remains an eligible corpus record but naturally cannot be retrieved; coverage reports this as missing evidence rather than an identity decision. Coverage reports count all three statuses, and policy changes are applied as versioned reclassification rather than new identities. Later schools and APL define their own equivalent policies before ingestion because their role taxonomies differ.
+
+### 8.3 Source precedence and field conflicts
 
 Institutional values are selected deterministically:
 
@@ -520,7 +644,9 @@ Institutional values are selected deterministically:
 
 Conflicting observations remain in `faculty_source_records`. The preferred display field follows precedence, then most recently observed value. Affiliations are additive rather than overwritten. Scholarly titles or affiliations never overwrite Hopkins faculty identity.
 
-### 8.3 Edge-case behavior
+Canonical display fields are recomputed from all active observations after an observation is activated/deactivated; they are not permanently copied from whichever adapter happened to run first.
+
+### 8.4 Edge-case behavior
 
 | Condition | Required behavior |
 |---|---|
@@ -533,6 +659,7 @@ Conflicting observations remain in `faculty_source_records`. The preferred displ
 | Missing publication abstract | Prefer abstract-bearing papers during selection; a useful title-only paper may be indexed with empty body and marked in metadata. |
 | Duplicate publication | Deduplicate per faculty by DOI/provider ID/title-year hierarchy. |
 | Faculty listed in many units | One faculty result, many affiliations/source records. |
+| Ambiguous faculty eligibility | Persist with `review`, exclude from normal search, and expose in coverage/review tooling. |
 | Faculty leaves Hopkins | Apply two-complete-snapshot deactivation; retain history and documents inactive. |
 | External request fails | Retry boundedly, log provenance/context, keep prior good data active, and mark run partial if completeness is unknown. |
 
@@ -567,7 +694,7 @@ The resolver records raw feature evidence and computes a versioned score in `[0,
 | Topic/department agreement | 0.15 | Candidate topics/papers agree with Hopkins research and unit. |
 | Coauthor or external-ID evidence | 0.05 | Known collaborators or ORCID/provider ID exposed by Hopkins. |
 
-Hard contradictions, such as a clearly different field and institution combined with no overlap, disqualify a candidate. An explicit Hopkins-exposed provider ID or ORCID mapped unambiguously may resolve directly after validation.
+Hard contradictions, such as a clearly different field and institution combined with no overlap, disqualify a candidate. An explicit Hopkins-exposed provider ID or ORCID mapped unambiguously may resolve directly after validation. For the initial resolver, topic/department agreement is deterministic normalized term overlap over Hopkins text and candidate paper/topic fields; it is not another embedding or language-model call. Any later semantic feature requires a new resolver version and labeled evaluation.
 
 Initial automatic decision policy:
 
@@ -579,7 +706,7 @@ Thresholds and weights are configuration/versioned policy, not hidden constants.
 
 ### 9.3 Persisted resolution validation
 
-On later runs, reuse the resolved scholarly author ID to avoid repeated search, but verify that the provider record still exists and its name is compatible. A validation failure changes the state to `ambiguous` or `unresolved`, leaves previously fetched publications inactive or quarantined according to policy, and requests review. Never silently switch from one author ID to another.
+On later runs, reuse the provider-specific resolved ID in `scholarly_author_links` to avoid repeated search, but verify that the provider record still exists and its name is compatible. A validation failure changes that link to `ambiguous` or `unresolved`, leaves previously fetched publications inactive or quarantined according to policy, and requests review. Never silently switch from one author ID to another.
 
 ## 10. Research document construction
 
@@ -605,19 +732,19 @@ The displayed title and body are stored separately. The embedding formatter uses
 
 ### 10.2 Chunking rules
 
-- A publication title plus abstract is always one document.
-- Keep a faculty research statement, faculty bio, or lab page as one document when its cleaned body is at most 1,200 model tokens.
-- For longer pages, split first on semantic headings/paragraph boundaries into chunks targeting 600–900 tokens, with a hard maximum of 1,200 and at most 100 tokens of paragraph-boundary overlap.
-- Never split a paragraph merely to hit the target unless it exceeds the hard maximum.
+- A publication title plus abstract normally remains one stored document. Sparse search indexes the full text. If its formatted dense input exceeds the encoder limit, truncate only the dense input at the last sentence boundary that fits and set `metadata.embedding_truncated=true`; never truncate the stored title/abstract or displayed evidence.
+- Keep a faculty research statement, faculty bio, or lab page as one document when its full formatted BGE input is at most 448 model tokens, reserving the rest of the 512-token model limit for title/markers/special tokens.
+- For longer pages, split first on semantic headings/paragraph boundaries into chunks targeting 280–400 body tokens, with a hard formatted-input maximum of 448 tokens and at most 50 tokens of paragraph-boundary overlap.
+- Never split a paragraph merely to hit the target unless it exceeds the hard maximum; then split by sentence boundary before using a tokenizer boundary as a last resort.
 - Every chunk repeats a concise source title, receives a stable source-local `chunk_key`, and links to the source page.
 - Remove navigation, repeated headers/footers, contact boilerplate, cookie text, and unrelated news listings. Preserve meaningful section headings.
 - Do not chunk short content or manufacture multiple near-duplicate documents to increase a faculty member's score.
 
-Store extractor version and cleaned-content hash in metadata so changes are auditable and embeddings can be invalidated correctly.
+Store extractor/formatter versions in metadata; store the full canonical title/body hash in `research_documents.content_hash` so changes are auditable and embeddings can be invalidated correctly.
 
 ### 10.3 Publication selection default
 
-For each resolved faculty author, consider approximately the last **7 years**, order newest first, prefer records with abstracts, and index at most **15** publications. Include a title-only paper only when needed to fill the limit and the title is substantive. Both `PUBLICATION_LOOKBACK_YEARS=7` and `MAX_PUBLICATIONS_PER_FACULTY=15` are configurable and must be evaluated. Do not build a publication-selection model.
+For each resolved faculty author, fetch up to `PUBLICATION_CANDIDATE_LIMIT=50` recent candidates, then use the ingestion run's UTC date as the reproducible cutoff and admit publication years from `cutoff_year - 6` through `cutoff_year` inclusive (the default **7 calendar years**). Deduplicate first. Select the newest abstract-bearing papers by full date then stable external ID, up to **15**; if fewer than 15 exist, fill remaining slots with the newest substantive title-only papers. Null-year papers are excluded from the default set and reported in diagnostics. Record cutoff date and policy version in the ingestion run. `PUBLICATION_CANDIDATE_LIMIT=50`, `PUBLICATION_LOOKBACK_YEARS=7`, and `MAX_PUBLICATIONS_PER_FACULTY=15` are configurable; the indexed count/lookback must be evaluated. Do not build a publication-selection model.
 
 ## 11. Embeddings and dense retrieval
 
@@ -639,6 +766,7 @@ class EmbeddingModel(Protocol):
 | Property | MVP default |
 |---|---|
 | Dimension | 768 |
+| Maximum sequence length | 512 BGE tokens; use the reserved budgets in Sections 3.4 and 10.2. |
 | Execution | Local CPU baseline; batching offline; GPU optional for one-off acceleration only. |
 | Vector normalization | L2-normalize document and query embeddings. |
 | Similarity | Cosine similarity, implemented as inner product on normalized vectors. |
@@ -646,9 +774,11 @@ class EmbeddingModel(Protocol):
 | Document formatting | `Title: {title}\nText: {text}` with no query instruction. |
 | Precision | `float32` unless measured storage/performance needs justify a change. |
 
-The fixed BGE instruction is deterministic embedding formatting, not LLM parsing or expansion. The student's raw meaning is sent directly to the embedding model. Store exact model name/revision and formatted-input hash with every vector. A model change requires a new embedding version and full re-embedding before comparison.
+The fixed BGE instruction is deterministic embedding formatting, not LLM parsing or expansion. The student's raw meaning is sent directly to the embedding model. `embedding_version` combines exact model name, pinned revision, tokenizer/settings, normalization, and formatter version. A model or formatting change creates a new version; build and validate it before atomically changing `search_index_state`.
 
 The corpus—several thousand faculty times roughly 10–20 documents—is small enough for CPU embedding and query inference. Core paid AI inference cost is `$0`.
+
+At search startup, load the query encoder identified by the active `embedding_version`. Fail fast if local configuration/model artifacts do not exactly match `search_index_state`; never query one model's document vectors with another model's query vector.
 
 ### 11.2 Vector search
 
@@ -658,13 +788,24 @@ Start with exact pgvector search:
 ORDER BY embedding <#> :normalized_query_vector
 ```
 
-over active, embedded documents, translating negative inner product to a higher-is-better diagnostic score. At expected MVP scale, exact search is simpler and likely sufficient. Add an HNSW cosine/inner-product index only after measured query latency exceeds the agreed budget; record build parameters and recall comparison. Do not add a separate vector database.
+over active documents joined to the active, content-hash-matching embedding version and active, eligible faculty, translating negative inner product to a higher-is-better diagnostic score. At expected MVP scale, exact search is simpler and likely sufficient. Add an HNSW cosine/inner-product index only after measured query latency exceeds the agreed budget; record build parameters and recall comparison. Do not add a separate vector database.
 
 Dense retrieval returns the top `DENSE_TOP_K=50`, with stable tie-breaking by `document_id`.
 
 ## 12. Sparse retrieval
 
-Use PostgreSQL full-text search first. Maintain a stored `tsvector` with English parsing, title weight `A`, and body weight `B`; create a GIN index. Convert the same query text with `websearch_to_tsquery('english', ...)` and rank using `ts_rank_cd`. Normalize or alias punctuation-heavy acronyms during indexing/query construction only with deterministic, tested rules; do not silently expand domain terminology.
+Use PostgreSQL full-text search first. Maintain a stored `tsvector` with English parsing, title weight `A`, and body text weight `B`; create a GIN index and rank with `ts_rank_cd`.
+
+Do **not** pass a long natural-language sentence directly to the default conjunctive behavior of `websearch_to_tsquery`: requiring nearly every surviving term would destroy recall. A deterministic `SparseQueryBuilder` instead:
+
+1. Unicode-normalizes and tokenizes the same built query, using the same PostgreSQL English parsing/stemming behavior as the index.
+2. Removes parser stop words, preserves acronyms/numbers, de-duplicates in first-occurrence order, and caps the query at `SPARSE_MAX_TERMS=32` for safety.
+3. Builds a parameterized OR query across the remaining lexemes. Explicit user-quoted phrases and each manually entered multiword method/research-interest item may add a phrase clause, also OR-connected.
+4. Never interpolates raw text into SQL and never invents synonyms or domain expansions.
+
+This is deterministic lexical query construction, not semantic parsing. Its exact token/phrase behavior is contract-tested. If all terms are removed, return no sparse hits and allow dense retrieval to carry the query.
+
+Sparse SQL applies the same active Faculty, eligibility, active-document, and current-content filters as dense retrieval (except that an embedding row is not required).
 
 Sparse retrieval exists because exact terms such as `DFT`, `LAMMPS`, `CRISPR`, `Raman spectroscopy`, `graph neural networks`, and `Bayesian optimization` may be diluted in semantic search. It returns `SPARSE_TOP_K=50`, sorted by rank descending and `document_id` for ties.
 
@@ -682,6 +823,8 @@ rrf(document) = Σ channel∈{dense,sparse} 1 / (RRF_K + rank_channel(document))
 
 Use one-based ranks, `RRF_K=60`, dense top 50, sparse top 50, and retain `HYBRID_TOP_K=100`. A document absent from a channel contributes zero for it. Sort by fused score descending, then best channel rank, then `document_id`. Preserve both channel ranks and raw diagnostic scores. Do not train weights.
 
+For dense-only and sparse-only evaluation, assign the same rank-space score `1 / (RRF_K + rank)` before faculty aggregation rather than passing incomparable cosine or FTS scores. Hybrid assigns the sum shown above. Thus the aggregation contract always consumes `fusion_score`; channel-native scores remain diagnostic only. This isolates the candidate ordering being compared and makes experiment results reproducible.
+
 ### 13.2 Faculty aggregation
 
 Group fused documents by `faculty_id`. Sort each faculty's evidence by fused score and keep the top three distinct documents. Compute:
@@ -694,7 +837,7 @@ faculty_score = 0.60 × best_rrf
 
 Missing positions contribute zero. This rewards one excellent match while allowing corroborating evidence to distinguish faculty and limiting prolific-author domination. Return at most `FACULTY_TOP_K=10`. Break ties by best supporting-document rank, then normalized faculty name, then `faculty_id`.
 
-Do not add document-type boosts initially. Do not let multiple near-identical chunks from the same source section occupy more than one of the three supporting slots; collapse them by `(source_name, external_id)` for aggregation while retaining raw retrieval diagnostics.
+Do not add document-type boosts initially. Do not let multiple near-identical chunks from the same source section occupy more than one of the three supporting slots; collapse them by `(document_type, external_id)` for aggregation while retaining raw retrieval diagnostics.
 
 Publication recency weighting is **off by default**. A future experiment may multiply publication RRF contributions by a bounded, documented decay; faculty research, bio, and lab documents never receive age decay. Search must work without recency.
 
@@ -711,18 +854,24 @@ Use one typed settings object loaded from environment variables and validated at
 ```text
 DATABASE_URL
 ENABLED_FACULTY_SOURCES=whiting
+FACULTY_ELIGIBILITY_POLICY_VERSION=whiting-v1
 
 EMBEDDING_MODEL=BAAI/bge-base-en-v1.5
 EMBEDDING_MODEL_REVISION=<pinned revision>
+DOCUMENT_FORMATTER_VERSION=v1
 EMBEDDING_BATCH_SIZE=<CPU-safe measured default>
 
+QUERY_MAX_CHARS=8000
+QUERY_MAX_TOKENS=480
 DENSE_TOP_K=50
 SPARSE_TOP_K=50
 HYBRID_TOP_K=100
 FACULTY_TOP_K=10
 RRF_K=60
+SPARSE_MAX_TERMS=32
 
 MAX_PUBLICATIONS_PER_FACULTY=15
+PUBLICATION_CANDIDATE_LIMIT=50
 PUBLICATION_LOOKBACK_YEARS=7
 AUTHOR_RESOLVE_THRESHOLD=0.80
 AUTHOR_AMBIGUOUS_THRESHOLD=0.60
@@ -750,8 +899,11 @@ Store a versioned, reviewable dataset under `data/evaluation/` containing:
 - Faculty judgments on a four-level scale: `3=excellent`, `2=relevant`, `1=weak`, `0=irrelevant`.
 - Judge identifier or adjudication status, timestamp, benchmark version, and corpus snapshot/version.
 - A candidate-pool provenance field so unjudged results are distinguishable from judged-zero results.
+- An `eligible_scope` field identifying the schools/units and corpus snapshot for which the query can be scored.
 
 Prefer judgments by domain-aware students/faculty or consensus of at least two reviewers for ambiguous cases. Build candidate pools from dense, sparse, and hybrid runs plus known faculty supplied by query authors. Randomize result presentation during judging. Do not treat unjudged documents as definitively irrelevant in analysis; report judgment coverage and manually adjudicate top unjudged results when comparing systems.
+
+The initial scored benchmark is Whiting-scoped. Hopkins-wide queries may be collected immediately, but they are not included in aggregate retrieval metrics until their relevant schools are represented and judged in the named corpus snapshot. Otherwise missing institutional coverage would be incorrectly counted as a search failure. Always report overall, in-scope-school, and query-slice metrics explicitly as coverage expands.
 
 ### 15.2 Metrics and unit of evaluation
 
@@ -763,7 +915,9 @@ Primary evaluation is at the **faculty** level after aggregation:
 
 Also retain document-level retrieval diagnostics, but do not substitute them for the faculty-level product outcome. Every result file records corpus snapshot, query-set version, judgment version, embedding model/revision, settings, code commit, and random seeds where applicable.
 
-At minimum compare dense-only, sparse-only, and RRF hybrid using identical corpus, judgments, aggregation, and candidate limits. Report per-query values, macro means, confidence intervals (bootstrap is adequate), and regressions rather than only aggregate winners.
+At minimum compare dense-only, sparse-only, and RRF hybrid using identical corpus, judgments, and aggregation. Record all channel/fused candidate limits. Run both the product configuration (50 dense + 50 sparse → at most 100 fused) and a budget-matched sensitivity comparison where each system may contribute the same total number of document candidates; otherwise an apparent hybrid gain may come only from a larger pool. Report per-query values, macro means, confidence intervals (bootstrap is adequate), and regressions rather than only aggregate winners.
+
+The evaluation runner overrides the production display default so it returns at least 20 faculty whenever computing Recall@20. Metric cutoffs must never exceed the available evaluated result depth without an explicit warning/error.
 
 ### 15.3 Evaluation flow
 
@@ -782,6 +936,7 @@ Track corpus health separately by school and overall:
 
 - Faculty count and active/inactive count.
 - Percentage with a Hopkins research summary.
+- Percentage eligible, review, and excluded under the current eligibility-policy version.
 - Percentage with a lab description.
 - Percentage resolved to a scholarly author.
 - Percentage ambiguous and unresolved.
@@ -833,7 +988,12 @@ External Hopkins requests and scholarly APIs are mocked in unit tests using chec
 - Parses representative Whiting directory/profile fixtures and normalizes fields.
 - Preserves source URL, source key, raw provenance, Unicode display names, and multiple affiliations.
 - Gives repeated identical input the same source/canonical IDs and no duplicate rows.
+- Marks snapshots incomplete when pagination/membership parsing is incomplete and never deactivates from them.
+- Applies the versioned faculty eligibility policy and excludes `review`/`excluded` records from search without discarding provenance.
 - Handles duplicate listings without merging unrelated common names.
+- Serializes overlapping ingestion runs per source and always releases the advisory lock on failure.
+- Recomputes preferred canonical fields when source precedence/activity changes.
+- Preserves document IDs through a manual faculty merge, consolidates document collisions, records redirects, and blocks conflicting scholarly identities.
 - Leaves prior good records active on partial/failed pages.
 - Applies two-complete-snapshot deactivation and reactivation correctly.
 - Runs every adapter fixture through a shared `FacultySource` contract suite.
@@ -841,19 +1001,23 @@ External Hopkins requests and scholarly APIs are mocked in unit tests using chec
 **Author resolution**
 
 - Resolves exact, strongly corroborated candidates.
+- Preserves the prior state when author-candidate fetching is incomplete or fails.
 - Marks common-name/close-candidate cases ambiguous.
 - Marks absent or weak candidates unresolved.
 - Requires a non-name signal and threshold margin.
 - Persists and reuses validated external author IDs.
+- Keeps resolution state provider-specific in `scholarly_author_links` and enforces uniqueness of resolved provider IDs.
 - Never attaches publications for low-confidence states.
 - Records feature evidence and resolver version.
 
 **Publication ingestion**
 
 - Deduplicates DOI, provider-ID, and normalized-title/year cases.
+- Deduplicates the same DOI across alternative scholarly-provider records without losing provider aliases.
 - Orders/selects by lookback, maximum count, and abstract preference.
 - Correctly retains useful missing-abstract title records.
 - Handles rate limits, transient failures, partial responses, and prior-data preservation.
+- Deactivates missing publications only from a complete bounded provider batch.
 
 **Research documents and embeddings**
 
@@ -862,6 +1026,7 @@ External Hopkins requests and scholarly APIs are mocked in unit tests using chec
 - Obeys chunk limits and removes boilerplate without losing meaningful headings.
 - Changes content in place, invalidates the embedding hash, and embeds only changed/missing inputs.
 - Stores normalized 768-dimensional vectors with exact model revision.
+- Builds candidate embedding versions without mixing them, rejects stale content hashes, and atomically activates only a complete version.
 
 **Query builder**
 
@@ -872,7 +1037,9 @@ External Hopkins requests and scholarly APIs are mocked in unit tests using chec
 
 - Dense retrieval ranks semantically related items in a tiny fixed corpus; isolate model-dependent tests and pin artifacts.
 - Sparse retrieval finds exact scientific terms, acronyms, and phrases.
+- Sparse query construction OR-connects content lexemes, caps term count, safely handles empty/quoted input, and does not interpolate raw SQL.
 - RRF uses one-based ranks, handles channel-only hits, and resolves ties deterministically.
+- Dense-only, sparse-only, and hybrid aggregation consume the documented reciprocal-rank score rather than native channel scores.
 - Aggregation applies `0.60/0.30/0.10`, zero-fills missing evidence, collapses duplicate chunks, and uses deterministic ties.
 - Inactive or unembedded documents and inactive faculty cannot surface.
 
@@ -949,10 +1116,10 @@ There are only four MVP phases. Tasks may be subdivided inside a phase, but no f
 
 - Initialize the Python repository and typed configuration.
 - Configure PostgreSQL, migrations, and pgvector.
-- Implement Faculty, source-record, affiliation, ingestion-run, and ResearchDocument persistence.
+- Implement Faculty, source-record, affiliation, scholarly-author-link, redirect, ingestion-run, ResearchDocument, versioned-embedding, and active-index-state persistence.
 - Implement `FacultySource`, Whiting discovery/profile parsing, normalization, provenance, identity/upsert behavior, and tests.
 - Implement `PublicationSource`, Semantic Scholar access, confidence-based author resolution, publication selection/deduplication, and tests.
-- Implement document construction, the local embedding interface/model, incremental embedding, and corpus/ingestion inspection.
+- Implement document construction, the local embedding interface/model, versioned incremental embedding with atomic activation, and corpus/ingestion inspection.
 - Once Whiting is reliable, add Krieger, then Bloomberg, Medicine, and other Hopkins units one at a time as justified. These remain Phase 1 work even if interleaved later.
 
 **Deliverable:** A clean, inspectable Hopkins research corpus with Whiting as the first complete source and a clear adapter path to broader Hopkins coverage. A faculty view shows Hopkins descriptions, lab evidence when available, recent publications, URLs, metadata, provenance, and embeddings.
@@ -1037,7 +1204,7 @@ All statuses below are **Accepted for MVP**. A later change must update the ADR'
 - **Decision:** Use a pinned local BGE model behind an embedding interface.
 - **Rationale:** Scale is modest, CPU is feasible, data flow is simple, and paid inference is unnecessary.
 - **Alternatives considered:** OpenAI or other hosted embeddings, permanent GPU service.
-- **Consequences:** Model artifacts and embedding versioning are operational responsibilities; core AI API cost is zero.
+- **Consequences:** Model artifacts, versioned embedding rows, and atomic active-version management are operational responsibilities; core AI API cost is zero.
 - **When to reconsider:** A controlled evaluation shows a material quality/latency gain worth external dependency and cost.
 
 ### ADR-005 — Raw natural language directly enters embeddings
@@ -1061,7 +1228,7 @@ All statuses below are **Accepted for MVP**. A later change must update the ADR'
 - **Decision:** Run PostgreSQL full-text retrieval alongside dense retrieval.
 - **Rationale:** Scientific acronyms, tool names, and exact methods benefit from lexical matching.
 - **Alternatives considered:** Dense-only retrieval, Elasticsearch/OpenSearch, learned sparse encoders.
-- **Consequences:** Two ranked lists and tokenization tests are required, but no extra service is introduced.
+- **Consequences:** Two ranked lists and a deterministic OR/phrase lexical-query builder require tests, but no extra service is introduced.
 - **When to reconsider:** Evaluation shows sparse adds no value, or PostgreSQL FTS is materially inadequate versus a simple BM25 alternative.
 
 ### ADR-008 — Reciprocal Rank Fusion
@@ -1157,7 +1324,7 @@ All statuses below are **Accepted for MVP**. A later change must update the ADR'
 - **Decision:** Semantic Scholar/OpenAlex supply publication and author metadata only after a canonical faculty record exists.
 - **Rationale:** Scholarly affiliations can be stale, incomplete, or ambiguous.
 - **Alternatives considered:** Building the faculty list from author affiliation searches.
-- **Consequences:** Publication outages do not remove faculty; faculty without matches remain searchable from Hopkins evidence.
+- **Consequences:** Publication outages do not remove faculty; provider-specific resolution lives in `scholarly_author_links`; faculty without matches remain searchable from Hopkins evidence.
 - **When to reconsider:** Do not reverse the authority direction; a new provider may replace the enrichment source behind the same contract.
 
 ### ADR-020 — Low-confidence authors remain unresolved
@@ -1221,6 +1388,10 @@ Future coding agents must:
 23. Do not rewrite unrelated code or create future-school placeholder modules.
 24. Preserve user data and existing work; migrations and destructive operations require explicit care.
 25. Include the phase deliverable/done criteria in task handoff notes.
+26. Never deactivate membership or publications from an incomplete source batch.
+27. Never mix embedding versions; activate a complete index version atomically and verify the query encoder matches it.
+28. Keep faculty eligibility, institutional activity, and research-document coverage as separate concepts.
+29. Ensure evaluation result depth reaches every reported metric cutoff and identify the eligible school/corpus scope.
 
 ## 23. Implementation status
 
@@ -1234,6 +1405,7 @@ Future coding agents must:
 - Broad Hopkins faculty scope defined.
 - School-adapter ingestion strategy defined.
 - Data model, interfaces, evaluation plan, and four-phase roadmap defined in this document.
+- Architecture consistency review completed for snapshot safety, eligibility, identity merges, provider abstraction, embedding versioning, token limits, sparse-query recall, and evaluation comparability.
 
 **In Progress**
 
@@ -1243,13 +1415,13 @@ Future coding agents must:
 
 1. Initialize the Python repository, test tooling, typed configuration, and lint/type-check conventions.
 2. Configure PostgreSQL + pgvector and create explicit migrations.
-3. Define Faculty, FacultyAffiliation, FacultySourceRecord, ResearchDocument, and IngestionRun models/repositories.
+3. Define Faculty, FacultyAffiliation, FacultySourceRecord, ScholarlyAuthorLink, FacultyRedirect, ResearchDocument, DocumentEmbedding, SearchIndexState, and IngestionRun models/repositories.
 4. Define and contract-test the `FacultySource` interface.
 5. Implement `WhitingFacultySource` discovery and profile parsing with fixtures.
-6. Implement normalization, stable upserts, provenance, multi-affiliation handling, and repeat-ingestion tests.
+6. Implement normalization, eligibility classification, stable upserts, redirects, provenance, multi-affiliation handling, snapshot completeness, and repeat-ingestion tests.
 7. Define and contract-test `PublicationSource`.
 8. Implement Semantic Scholar candidate lookup, conservative author resolution, and publication enrichment.
-9. Implement document construction and incremental local BGE embeddings.
+9. Implement document construction and versioned incremental local BGE embeddings with atomic activation.
 
 **Future Faculty Sources**
 
