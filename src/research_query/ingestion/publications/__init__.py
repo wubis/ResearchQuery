@@ -1,0 +1,1 @@
+"""Scholarly publication provider adapters."""

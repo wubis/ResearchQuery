@@ -1,0 +1,1 @@
+"""Faculty source adapters."""

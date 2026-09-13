@@ -1,0 +1,30 @@
+{
+  "total": 2,
+  "data": [
+    {
+      "authorId": "111",
+      "name": "José Álvarez",
+      "affiliations": ["Johns Hopkins University"],
+      "papers": [
+        {
+          "paperId": "paper-a",
+          "title": "Generative Models for Crystal Discovery",
+          "abstract": "We generate stable crystal structures.",
+          "year": 2026,
+          "publicationDate": "2026-04-01",
+          "url": "https://www.semanticscholar.org/paper/paper-a",
+          "externalIds": {"DOI": "10.1000/CRYSTAL"},
+          "authors": [{"name": "José Álvarez"}],
+          "venue": "Materials AI",
+          "fieldsOfStudy": ["Materials Science", "Machine Learning"]
+        }
+      ]
+    },
+    {
+      "authorId": "222",
+      "name": "Jose Alvarez",
+      "affiliations": ["University of Somewhere Else"],
+      "papers": [{"paperId": "paper-b", "title": "Medieval Literature", "year": 2024}]
+    }
+  ]
+}

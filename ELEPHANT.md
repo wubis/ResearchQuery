@@ -2,7 +2,7 @@
 
 **Document role:** Long-term source of truth for short-context coding agents  
 **Project:** ResearchQuery  
-**Status:** Design baseline; implementation has not started  
+**Status:** Phase 1 foundation implemented; production-source verification pending  
 **Current phase:** Phase 1 — Research Corpus  
 **Last updated:** 2026-09-13
 
@@ -229,12 +229,14 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Mapping, Protocol
 
+
 @dataclass(frozen=True)
 class RawAffiliation:
     school: str
     department: str | None = None
     title: str | None = None
     source_url: str | None = None
+
 
 @dataclass(frozen=True)
 class RawFacultyRecord:
@@ -254,6 +256,7 @@ class RawFacultyRecord:
     external_identifiers: Mapping[str, str] = field(default_factory=dict)
     source_payload: Mapping[str, object] = field(default_factory=dict)
 
+
 @dataclass(frozen=True)
 class FacultySourceSnapshot:
     source_name: str
@@ -262,6 +265,7 @@ class FacultySourceSnapshot:
     records: tuple[RawFacultyRecord, ...]
     membership_complete: bool
     errors: tuple[str, ...] = ()
+
 
 class FacultySource(Protocol):
     source_name: str
@@ -284,6 +288,7 @@ class FacultyForResolution:
     known_publication_titles: tuple[str, ...]
     external_identifiers: Mapping[str, str]
 
+
 @dataclass(frozen=True)
 class AuthorCandidate:
     source_name: str
@@ -293,12 +298,14 @@ class AuthorCandidate:
     topics: tuple[str, ...]
     known_papers: tuple["PublicationRecord", ...]
 
+
 @dataclass(frozen=True)
 class AuthorCandidateBatch:
     candidates: tuple[AuthorCandidate, ...]
     fetched_at: datetime
     complete_for_request: bool
     errors: tuple[str, ...] = ()
+
 
 @dataclass(frozen=True)
 class PublicationRecord:
@@ -313,6 +320,7 @@ class PublicationRecord:
     authors: tuple[str, ...]
     metadata: Mapping[str, object]
 
+
 @dataclass(frozen=True)
 class PublicationBatch:
     records: tuple[PublicationRecord, ...]
@@ -320,13 +328,12 @@ class PublicationBatch:
     complete_for_request: bool
     errors: tuple[str, ...] = ()
 
+
 class PublicationSource(Protocol):
     source_name: str
 
     def find_authors(self, faculty: "FacultyForResolution") -> AuthorCandidateBatch: ...
-    def get_publications(
-        self, author_id: str, *, candidate_limit: int, start_year: int | None
-    ) -> PublicationBatch: ...
+    def get_publications(self, author_id: str, *, candidate_limit: int, start_year: int | None) -> PublicationBatch: ...
 ```
 
 Provider responses are mapped to these types at the boundary. `complete_for_request` means all pages required by that bounded candidate/publication request were fetched successfully. A failed candidate request preserves the prior resolution state rather than becoming a false `unresolved`; only a complete candidate batch may produce a new resolution decision, and only a complete publication batch may drive publication deactivation. The ingestion pipeline owns confidence decisions and persistence. Semantic Scholar is first; OpenAlex may later implement the same interface.
@@ -341,6 +348,7 @@ class ResearchQuery:
     methods: tuple[str, ...] = ()
     background: tuple[str, ...] = ()
 
+
 @dataclass(frozen=True)
 class SupportingDocument:
     document_id: UUID
@@ -354,6 +362,7 @@ class SupportingDocument:
     sparse_rank: int | None
     fused_rank: int
     fused_score: float
+
 
 @dataclass(frozen=True)
 class FacultySearchResult:
@@ -392,24 +401,27 @@ class RankedDocument:
     channel: str  # "dense", "sparse", or "hybrid"
     channel_ranks: Mapping[str, int]
 
+
 class DenseRetriever(Protocol):
     def search(self, query_text: str, *, limit: int) -> list[RankedDocument]: ...
 
+
 class SparseRetriever(Protocol):
     def search(self, query_text: str, *, limit: int) -> list[RankedDocument]: ...
+
 
 class HybridRetriever(Protocol):
     def fuse(
         self,
         dense: list[RankedDocument],
         sparse: list[RankedDocument],
-        *, limit: int,
+        *,
+        limit: int,
     ) -> list[RankedDocument]: ...
 
+
 class FacultyAggregator(Protocol):
-    def aggregate(
-        self, documents: list[RankedDocument], *, limit: int
-    ) -> list[FacultySearchResult]: ...
+    def aggregate(self, documents: list[RankedDocument], *, limit: int) -> list[FacultySearchResult]: ...
 ```
 
 The orchestration in `SearchService.search()` should stay visibly linear:
@@ -418,12 +430,8 @@ The orchestration in `SearchService.search()` should stay visibly linear:
 query_text = query_builder.build(query)
 dense = dense_retriever.search(query_text, limit=settings.dense_top_k)
 sparse = sparse_retriever.search(query_text, limit=settings.sparse_top_k)
-documents = hybrid_retriever.fuse(
-    dense, sparse, limit=settings.hybrid_top_k
-)
-return faculty_aggregator.aggregate(
-    documents, limit=settings.faculty_top_k
-)
+documents = hybrid_retriever.fuse(dense, sparse, limit=settings.hybrid_top_k)
+return faculty_aggregator.aggregate(documents, limit=settings.faculty_top_k)
 ```
 
 `native_score` is for channel diagnostics only. `fusion_score` is the rank-space value consumed by aggregation: one reciprocal-rank term for a single-channel result, or their sum for hybrid RRF. No caller may aggregate raw cosine and FTS scores as though they shared a scale.
@@ -1406,22 +1414,32 @@ Future coding agents must:
 - School-adapter ingestion strategy defined.
 - Data model, interfaces, evaluation plan, and four-phase roadmap defined in this document.
 - Architecture consistency review completed for snapshot safety, eligibility, identity merges, provider abstraction, embedding versioning, token limits, sparse-query recall, and evaluation comparability.
+- Python package, strict typed settings, environment example, Ruff, mypy, and pytest tooling initialized.
+- Explicit checksum-protected PostgreSQL migration added for pgvector, canonical faculty, source observations, affiliations, provider-specific author links, redirects, ingestion runs, corpus snapshots, independently searchable research documents, 768-dimensional versioned embeddings, and singleton active-index state.
+- PostgreSQL persistence implements stable source/canonical identities, exact institutional URL matching, raw-plus-normalized provenance, additive multi-affiliations, canonical field recomputation, idempotent upserts, two-complete-snapshot deactivation/reactivation, publication grace handling, redirect lookup, and transactional manual merges with scholarly-identity conflict protection.
+- `FacultySource` and fixture-backed `WhitingFacultySource` implemented with pagination-cycle/parse safety, optional profile-failure preservation, Unicode and multi-affiliation parsing, Hopkins profile/research/bio/linked-lab evidence, stable source keys, bounded retry/cache HTTP boundaries, and complete-versus-partial snapshot semantics.
+- Whiting v1 eligibility classification implemented as a separate, persisted policy outcome; review/excluded records retain provenance.
+- `PublicationSource` and fixture-backed Semantic Scholar adapter implemented with bounded pagination, canonical provider mapping, retry-safe complete-request semantics, and fatal authentication/configuration failures.
+- Conservative auditable author resolver implemented with versioned features/thresholds, explicit provider-ID validation, non-name evidence and margin gates, manual-decision preservation, persisted-ID validation, and publication quarantine on automated validation failure. Ambiguous/unresolved identities receive no publications.
+- Deterministic recent-publication deduplication/selection implemented using DOI, provider ID, and normalized title/year aliases with provider provenance, seven-calendar-year cutoff, abstract preference, stable ordering, and title-only fallback.
+- Stable UUIDv5 ResearchDocument construction implemented for independent research, biography, linked lab, and publication evidence, including source URLs, content hashes, tokenizer-aware semantic chunking, boilerplate removal, immutable identity aliases, and explicit dense-input truncation state.
+- Local pinned `BAAI/bge-base-en-v1.5` boundary implemented at revision `a5beb1e3e68b9ab74eb54cfd186867f64f240e1a`, with query/document formatting separation, float32-compatible L2 normalization, incremental content-hash embedding, completeness validation, and atomic activation.
+- Operator commands added for migrations, Whiting/Semantic Scholar ingestion, embedding activation, and corpus/run inspection.
+- Default fixture-backed suite covers source/provider contracts, normalization and safety policy, author-resolution gates, publication policy, stable documents/chunks, retry/cache behavior, ingestion no-attachment behavior, and embedding version mechanics without live network calls.
 
 **In Progress**
 
-- None.
+- Production verification of Whiting's current selectors, pagination, eligibility evidence, and expected directory counts.
+- Disposable PostgreSQL + pgvector execution of the committed migration/repository integration test.
+- First exact-revision BGE artifact load and CPU throughput measurement.
 
 **Next Recommended Tasks**
 
-1. Initialize the Python repository, test tooling, typed configuration, and lint/type-check conventions.
-2. Configure PostgreSQL + pgvector and create explicit migrations.
-3. Define Faculty, FacultyAffiliation, FacultySourceRecord, ScholarlyAuthorLink, FacultyRedirect, ResearchDocument, DocumentEmbedding, SearchIndexState, and IngestionRun models/repositories.
-4. Define and contract-test the `FacultySource` interface.
-5. Implement `WhitingFacultySource` discovery and profile parsing with fixtures.
-6. Implement normalization, eligibility classification, stable upserts, redirects, provenance, multi-affiliation handling, snapshot completeness, and repeat-ingestion tests.
-7. Define and contract-test `PublicationSource`.
-8. Implement Semantic Scholar candidate lookup, conservative author resolution, and publication enrichment.
-9. Implement document construction and versioned incremental local BGE embeddings with atomic activation.
+1. Verify and, if necessary, update Whiting selectors against the live authoritative directory; pin sampled/total count expectations and add sanitized fixtures for the observed production markup.
+2. Run `tests/test_postgres_integration.py` against a disposable PostgreSQL instance with the actual pgvector extension; fix any SQL/driver differences before production ingestion.
+3. Load the exact pinned BGE artifact locally, verify the tokenizer/model revision match, and record CPU embedding throughput and memory on documented hardware.
+4. Run the first inspected Whiting snapshot, review `review`/`excluded` eligibility records and common-name author decisions, then validate idempotent refresh and two-complete-snapshot behavior on the real corpus.
+5. Build a manually reviewed author-resolution set before changing the conservative v1 thresholds.
 
 **Future Faculty Sources**
 
@@ -1438,13 +1456,17 @@ Future coding agents must:
 
 **Blocked**
 
-- None.
+- A direct Whiting HTML selector-verification request from the 2026-09-13 development environment returned HTTP 403. Fixture behavior is verified, but live selectors and full authoritative counts are not.
+- No disposable PostgreSQL service was available in the development environment (`TEST_DATABASE_URL` unset and the local Docker daemon unavailable), so the pgvector integration test is committed but was skipped.
 
 **Known Issues**
 
-- Whiting source structure and authoritative faculty eligibility rules must be verified during adapter implementation.
+- Whiting parsing is fixture-backed but current live markup/selectors and authoritative faculty eligibility evidence remain unverified because the source returned HTTP 403. Do not claim a reliable production crawl until this is resolved and observed markup/count fixtures are added.
 - Automated scholarly-author resolution requires a manually labeled validation set before its thresholds can be trusted.
-- Exact CPU embedding throughput and exact pgvector query latency remain to be measured on the real corpus.
+- The exact BGE revision is pinned and its repository revision was verified, but the real artifact was not downloaded/executed locally; CPU embedding throughput remains unmeasured.
+- Migration and repository semantics have an opt-in PostgreSQL+pgvector integration test, but that test has not run in this environment. SQL execution and atomic activation are therefore not claimed as locally passed.
+- Linked lab descriptions are constructed only when they are explicitly present on the authoritative profile (or supplied as clearly attributable `LabEvidence`); the adapter does not broadly crawl personal/lab sites.
+- Exact pgvector query latency remains to be measured on the real corpus.
 - Relevance judgments do not yet exist, so numeric search-quality acceptance thresholds cannot yet be set.
 
 When completing work, edit this status conservatively: move only genuinely completed items, name active work precisely, and add concrete blockers/issues. Do not mark a phase complete until every stated “Done when” condition is satisfied.
