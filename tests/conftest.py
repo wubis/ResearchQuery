@@ -21,6 +21,8 @@ class FixtureTransport:
         value = self.responses[url]
         if isinstance(value, Exception):
             raise value
+        if isinstance(value, HttpResponse):
+            return value
         if isinstance(value, bytes):
             body = value
         elif isinstance(value, str):

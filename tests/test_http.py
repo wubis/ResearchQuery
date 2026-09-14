@@ -63,3 +63,40 @@ def test_run_scoped_cache_reuses_identical_get(fixture_transport: type) -> None:
     assert cached.get("https://example.edu").body == b"body"
     assert cached.get("https://example.edu").body == b"body"
     assert len(wrapped.requests) == 1
+
+
+def test_transport_paces_successive_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    now = 100.0
+    delays: list[float] = []
+
+    class Response:
+        status = 200
+        headers = Message()
+        url = "https://example.edu"
+
+        def read(self) -> bytes:
+            return b"ok"
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *args: object) -> None:
+            return None
+
+    def fake_sleep(seconds: float) -> None:
+        nonlocal now
+        delays.append(seconds)
+        now += seconds
+
+    monkeypatch.setattr("research_query.ingestion.http.urlopen", lambda *args, **kwargs: Response())
+    transport = RetryingHttpTransport(
+        user_agent="ResearchQuery/0.1 contact@example.edu",
+        timeout_seconds=1,
+        max_retries=0,
+        min_interval_seconds=5,
+        sleep=fake_sleep,
+        clock=lambda: now,
+    )
+    transport.get("https://example.edu/one")
+    transport.get("https://example.edu/two")
+    assert delays == [5.0]

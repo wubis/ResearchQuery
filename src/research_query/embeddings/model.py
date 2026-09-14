@@ -83,7 +83,12 @@ class LocalEmbeddingModel:
             SentenceTransformer = module.SentenceTransformer
             model = SentenceTransformer(model_id, revision=revision, device=device)
         self._model = cast(Any, model)
-        embedding_dimension = self._model.get_sentence_embedding_dimension()
+        current_dimension_method = getattr(self._model, "get_embedding_dimension", None)
+        embedding_dimension = (
+            current_dimension_method()
+            if callable(current_dimension_method)
+            else self._model.get_sentence_embedding_dimension()
+        )
         if embedding_dimension != self.dimension:
             raise ValueError(f"expected 768-dimensional model, got {embedding_dimension}")
         self._model.max_seq_length = 512

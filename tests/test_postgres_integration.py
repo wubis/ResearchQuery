@@ -154,6 +154,9 @@ def test_migrations_idempotence_and_snapshot_safety_against_pgvector() -> None:
             assert ordered[0] == document_ids[0]
             state = connection.execute("SELECT embedding_version FROM search_index_state").fetchone()
             assert state == ("test-v1",)
+        coverage = repository.inspect_corpus()
+        assert coverage["faculty"]["eligible_with_documents"] == 2
+        assert coverage["faculty"]["eligible_without_documents"] == 0
         database.close()
     finally:
         with psycopg.connect(database_url, autocommit=True) as bootstrap:

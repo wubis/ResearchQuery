@@ -2,9 +2,9 @@
 
 **Document role:** Long-term source of truth for short-context coding agents  
 **Project:** ResearchQuery  
-**Status:** Phase 1 foundation implemented; production-source verification pending  
+**Status:** Phase 1 Whiting corpus locally verified; live publication enrichment pending provider quota
 **Current phase:** Phase 1 — Research Corpus  
-**Last updated:** 2026-09-13
+**Last updated:** 2026-09-14
 
 Before changing this repository, read this document in full. If code and this document disagree, stop and determine whether the code is an intentional, recorded architectural change. Update the relevant ADR and this document in the same change; do not silently let the design drift.
 
@@ -1426,20 +1426,23 @@ Future coding agents must:
 - Local pinned `BAAI/bge-base-en-v1.5` boundary implemented at revision `a5beb1e3e68b9ab74eb54cfd186867f64f240e1a`, with query/document formatting separation, float32-compatible L2 normalization, incremental content-hash embedding, completeness validation, and atomic activation.
 - Operator commands added for migrations, Whiting/Semantic Scholar ingestion, embedding activation, and corpus/run inspection.
 - Default fixture-backed suite covers source/provider contracts, normalization and safety policy, author-resolution gates, publication policy, stable documents/chunks, retry/cache behavior, ingestion no-attachment behavior, and embedding version mechanics without live network calls.
+- Live Whiting directory audited from campus access with a descriptive contact user agent and the site's five-second crawl delay: 50 pages, 492 cards, 442 linked and 50 unlinked. The Hopkins-owned public WordPress people collection also has 492 records. The adapter reconciles linked profiles by canonical URL and unlinked profiles by unique normalized name, permitting only a single omitted middle initial; ambiguous matches keep membership incomplete. It ingests the batch feed rather than requesting 492 individual profiles.
+- A full live local ingest completed with 492 source records and zero errors. The corrected refresh created one previously missing record and changed no existing documents. The local PostgreSQL 16 + pgvector corpus has 473 eligible faculty and 19 review cases (all emeritus/emerita); 562 active biography chunks, with 423 eligible faculty having documents and 50 without. No structured research-summary or lab documents were found in this source pass.
+- The exact pinned BGE artifact was downloaded and verified on CPU (768 dimensions, unit norm, deterministic repeated output). A warm 16-document test took 1.24 seconds (about 13 documents/second, about 762 MB peak RSS). The local active index contains 536 eligible-document embeddings with no missing or stale embeddings.
+- The disposable PostgreSQL + pgvector integration suite passes: 43 tests total, plus Ruff and mypy.
+- The Semantic Scholar live transport is paced at least 1.1 seconds between requests for its introductory keyed quota; 429 responses remain partial rather than being treated as absent authors or publications.
 
 **In Progress**
 
-- Production verification of Whiting's full directory counts, unlinked membership cards, and eligibility evidence.
-- Disposable PostgreSQL + pgvector execution of the committed migration/repository integration test.
-- First exact-revision BGE artifact load and CPU throughput measurement.
+- Live Semantic Scholar publication enrichment and conservative author-decision audit. A representative unauthenticated author-search request returned HTTP 429; the local corpus currently has no author resolutions or publication documents. Obtain a provider key or approved sufficient quota rather than bypassing limits.
+- Review source-content gaps for the 50 eligible faculty without biography/research documents and confirm whether another authoritative Hopkins source can supply evidence. Do not synthesize missing research claims.
 
 **Next Recommended Tasks**
 
-1. Resolve or explicitly model Whiting directory cards lacking a profile link, then verify full-directory counts and eligibility evidence before a production crawl. Current markup and first/last-page samples are fixture-backed.
-2. Run `tests/test_postgres_integration.py` against a disposable PostgreSQL instance with the actual pgvector extension; fix any SQL/driver differences before production ingestion.
-3. Load the exact pinned BGE artifact locally, verify the tokenizer/model revision match, and record CPU embedding throughput and memory on documented hardware.
-4. Run the first inspected Whiting snapshot, review `review`/`excluded` eligibility records and common-name author decisions, then validate idempotent refresh and two-complete-snapshot behavior on the real corpus.
-5. Build a manually reviewed author-resolution set before changing the conservative v1 thresholds.
+1. Configure a Semantic Scholar API key or approved sufficient quota, run full Whiting plus publication ingestion, and audit resolved/ambiguous/unresolved common names before attaching or trusting publications. Keep low-confidence author records publication-free.
+2. Review the 50 eligible members with no source documents and the 19 emeritus/emerita review cases. A later Hopkins adapter may add evidence, but Whiting membership and document coverage remain separate.
+3. Re-embed after publication ingestion and verify zero missing/stale eligible-document embeddings and preserved stable IDs. Exercise a subsequent complete Whiting refresh only when needed, respecting the site's five-second delay.
+4. Build a manually reviewed author-resolution set before changing the conservative v1 thresholds.
 
 **Future Faculty Sources**
 

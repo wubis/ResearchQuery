@@ -663,6 +663,14 @@ class PostgresCorpusRepository:
                 FROM faculty
                 """
             ).fetchone()
+            eligible_with_documents = connection.execute(
+                """
+                SELECT count(DISTINCT f.faculty_id)
+                FROM faculty f
+                JOIN research_documents d ON d.faculty_id = f.faculty_id AND d.is_active
+                WHERE f.is_active AND f.eligibility_status = 'eligible'
+                """
+            ).fetchone()[0]
             source_records = connection.execute(
                 """
                 SELECT source_name,
@@ -721,6 +729,8 @@ class PostgresCorpusRepository:
                 "review": faculty[3],
                 "excluded": faculty[4],
                 "with_research_summary": faculty[5],
+                "eligible_with_documents": eligible_with_documents,
+                "eligible_without_documents": faculty[2] - eligible_with_documents,
             },
             "source_records": [
                 {"source": row[0], "active": row[1], "inactive": row[2], "stale": row[3]} for row in source_records

@@ -26,3 +26,7 @@ def test_settings_reject_moving_model_revision_and_bad_thresholds() -> None:
         Settings(embedding_model_revision="main").validate()
     with pytest.raises(ConfigurationError):
         Settings(author_ambiguous_threshold=0.9, author_resolve_threshold=0.8).validate()
+    with pytest.raises(ConfigurationError):
+        Settings(whiting_min_interval_seconds=-1).validate()
+    with pytest.raises(ConfigurationError):
+        Settings(semantic_scholar_min_interval_seconds=-1).validate()

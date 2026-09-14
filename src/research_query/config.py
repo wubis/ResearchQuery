@@ -35,6 +35,8 @@ class Settings:
     http_user_agent: str = "ResearchQuery/0.1 (contact: replace-with-project-email@example.edu)"
     http_timeout_seconds: float = 20.0
     http_max_retries: int = 3
+    whiting_min_interval_seconds: float = 5.0
+    semantic_scholar_min_interval_seconds: float = 1.1
 
     @classmethod
     def from_env(cls, environ: Mapping[str, str] | None = None) -> Self:
@@ -82,6 +84,10 @@ class Settings:
             raise ConfigurationError("grace runs and retry counts cannot be negative")
         if self.http_timeout_seconds <= 0:
             raise ConfigurationError("http_timeout_seconds must be positive")
+        if self.whiting_min_interval_seconds < 0:
+            raise ConfigurationError("whiting_min_interval_seconds must be nonnegative")
+        if self.semantic_scholar_min_interval_seconds < 0:
+            raise ConfigurationError("semantic_scholar_min_interval_seconds must be nonnegative")
         if not self.enabled_faculty_sources:
             raise ConfigurationError("at least one faculty source must be enabled")
         if self.author_ambiguous_threshold > self.author_resolve_threshold:

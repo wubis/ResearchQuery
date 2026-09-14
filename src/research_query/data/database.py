@@ -13,7 +13,7 @@ class Database:
             from psycopg_pool import ConnectionPool
         except ImportError as exc:  # pragma: no cover - installation boundary
             raise RuntimeError("install psycopg[pool] to use PostgreSQL persistence") from exc
-        self.pool: Any = ConnectionPool(database_url, min_size=min_size, max_size=max_size)
+        self.pool: Any = ConnectionPool(database_url, min_size=min_size, max_size=max_size, open=True)
 
     def close(self) -> None:
         self.pool.close()

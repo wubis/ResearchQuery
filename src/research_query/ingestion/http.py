@@ -56,16 +56,30 @@ class RetryingHttpTransport:
         user_agent: str,
         timeout_seconds: float,
         max_retries: int,
+        min_interval_seconds: float = 0.0,
         sleep: Callable[[float], None] = time.sleep,
+        clock: Callable[[], float] = time.monotonic,
         jitter: Callable[[], float] = random.random,
     ) -> None:
         if "replace-with-project-email" in user_agent:
             raise ValueError("configure a descriptive HTTP_USER_AGENT contact before live requests")
+        if min_interval_seconds < 0:
+            raise ValueError("min_interval_seconds must be nonnegative")
         self.user_agent = user_agent
         self.timeout_seconds = timeout_seconds
         self.max_retries = max_retries
+        self.min_interval_seconds = min_interval_seconds
         self._sleep = sleep
+        self._clock = clock
         self._jitter = jitter
+        self._last_request_started: float | None = None
+
+    def _pace(self) -> None:
+        if self._last_request_started is not None:
+            remaining = self.min_interval_seconds - (self._clock() - self._last_request_started)
+            if remaining > 0:
+                self._sleep(remaining)
+        self._last_request_started = self._clock()
 
     @staticmethod
     def _headers(message: Message | None) -> dict[str, str]:
@@ -89,6 +103,7 @@ class RetryingHttpTransport:
         request_headers = {"User-Agent": self.user_agent, "Accept": "text/html,application/json"}
         request_headers.update(headers or {})
         for attempt in range(self.max_retries + 1):
+            self._pace()
             try:
                 request = Request(url, headers=request_headers)
                 with urlopen(request, timeout=self.timeout_seconds) as response:
