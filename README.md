@@ -42,9 +42,12 @@ activates a version only after the database rechecks every active eligible docum
 
 ## Current verification limits
 
-- Whiting parsing is covered by minimized directory/profile fixtures, including pagination and
-  incomplete snapshots. A one-time live selector check from this environment received HTTP 403, so
-  operators must verify selectors and authoritative counts before a production crawl.
+- Whiting parsing is covered by minimized directory/profile fixtures, including current live card,
+  profile, and pagination markup. On 2026-09-14, campus-network requests returned HTTP 200: the
+  directory declared 50 pages, with 10 cards on page 1 and 2 on page 50. One page-1 card had no
+  profile link, so the adapter reports that membership page as incomplete rather than treating its
+  department or email link as a profile. Full-directory counts and eligibility still need review
+  before a production crawl.
 - The PostgreSQL integration test is present and opt-in. It was not run in the initial environment
   because no `TEST_DATABASE_URL` was configured and the Docker daemon was unavailable.
 - The BGE model/revision boundary is unit-tested with an injected local backend. Download and CPU

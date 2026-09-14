@@ -1429,13 +1429,13 @@ Future coding agents must:
 
 **In Progress**
 
-- Production verification of Whiting's current selectors, pagination, eligibility evidence, and expected directory counts.
+- Production verification of Whiting's full directory counts, unlinked membership cards, and eligibility evidence.
 - Disposable PostgreSQL + pgvector execution of the committed migration/repository integration test.
 - First exact-revision BGE artifact load and CPU throughput measurement.
 
 **Next Recommended Tasks**
 
-1. Verify and, if necessary, update Whiting selectors against the live authoritative directory; pin sampled/total count expectations and add sanitized fixtures for the observed production markup.
+1. Resolve or explicitly model Whiting directory cards lacking a profile link, then verify full-directory counts and eligibility evidence before a production crawl. Current markup and first/last-page samples are fixture-backed.
 2. Run `tests/test_postgres_integration.py` against a disposable PostgreSQL instance with the actual pgvector extension; fix any SQL/driver differences before production ingestion.
 3. Load the exact pinned BGE artifact locally, verify the tokenizer/model revision match, and record CPU embedding throughput and memory on documented hardware.
 4. Run the first inspected Whiting snapshot, review `review`/`excluded` eligibility records and common-name author decisions, then validate idempotent refresh and two-complete-snapshot behavior on the real corpus.
@@ -1456,12 +1456,12 @@ Future coding agents must:
 
 **Blocked**
 
-- A direct Whiting HTML selector-verification request from the 2026-09-13 development environment returned HTTP 403. Fixture behavior is verified, but live selectors and full authoritative counts are not.
+- Direct Whiting requests returned HTTP 403 on 2026-09-13. Campus-network requests returned HTTP 200 on 2026-09-14, but production access from other networks remains unverified.
 - No disposable PostgreSQL service was available in the development environment (`TEST_DATABASE_URL` unset and the local Docker daemon unavailable), so the pgvector integration test is committed but was skipped.
 
 **Known Issues**
 
-- Whiting parsing is fixture-backed but current live markup/selectors and authoritative faculty eligibility evidence remain unverified because the source returned HTTP 403. Do not claim a reliable production crawl until this is resolved and observed markup/count fixtures are added.
+- Whiting's current card, profile, and pagination selectors are backed by minimized fixtures and live first/last-page checks. The directory declared 50 pages on 2026-09-14; page 1 had 10 cards, one without a profile link, and page 50 had 2 cards. The unlinked card keeps the snapshot incomplete. Full-directory counts and authoritative eligibility evidence remain unverified; do not claim a reliable production crawl yet.
 - Automated scholarly-author resolution requires a manually labeled validation set before its thresholds can be trusted.
 - The exact BGE revision is pinned and its repository revision was verified, but the real artifact was not downloaded/executed locally; CPU embedding throughput remains unmeasured.
 - Migration and repository semantics have an opt-in PostgreSQL+pgvector integration test, but that test has not run in this environment. SQL execution and atomic activation are therefore not claimed as locally passed.

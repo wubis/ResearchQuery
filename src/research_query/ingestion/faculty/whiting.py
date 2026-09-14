@@ -22,16 +22,14 @@ class _Node:
     attrs: dict[str, str]
     parent: _Node | None
     children: list[_Node] = field(default_factory=list)
-    own_text: list[str] = field(default_factory=list)
+    content: list[str | _Node] = field(default_factory=list)
 
     @property
     def classes(self) -> set[str]:
         return set(self.attrs.get("class", "").split())
 
     def text(self) -> str:
-        pieces = [*self.own_text]
-        for child in self.children:
-            pieces.append(child.text())
+        pieces = [part if isinstance(part, str) else part.text() for part in self.content]
         return " ".join(piece for piece in pieces if piece)
 
     def descendants(self) -> list[_Node]:
@@ -53,6 +51,7 @@ class _TreeParser(HTMLParser):
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         node = _Node(tag, {key: value or "" for key, value in attrs}, self.current)
         self.current.children.append(node)
+        self.current.content.append(node)
         if tag not in self._VOID:
             self.current = node
 
@@ -72,7 +71,7 @@ class _TreeParser(HTMLParser):
     def handle_data(self, data: str) -> None:
         value = clean_text(data)
         if value:
-            self.current.own_text.append(value)
+            self.current.content.append(value)
 
 
 def _parse(html: str) -> _Node:
@@ -113,7 +112,7 @@ def parse_directory_page(html: str, page_url: str) -> tuple[tuple[_DirectoryReco
     cards = [
         node
         for node in root.descendants()
-        if node.attrs.get("data-faculty-id") or node.classes.intersection({"faculty-card", "person-card"})
+        if node.attrs.get("data-faculty-id") or node.classes.intersection({"faculty-card", "person-card", "entity"})
     ]
     records: list[_DirectoryRecord] = []
     errors: list[str] = []
@@ -122,16 +121,24 @@ def parse_directory_page(html: str, page_url: str) -> tuple[tuple[_DirectoryReco
         if id(card) in seen_nodes:
             continue
         seen_nodes.add(id(card))
-        link = _first(card, classes={"faculty-name", "profile-link"}, tags={"a"}) or _first(card, tags={"a"})
-        name_node = _first(card, classes={"faculty-name", "person-name"}) or _first(card, tags={"h2", "h3", "h4"})
+        name_node = _first(card, classes={"entity_name", "faculty-name", "person-name"}) or _first(
+            card, tags={"h2", "h3", "h4"}
+        )
+        link = _first(card, classes={"entity_name_link", "faculty-name", "profile-link"}, tags={"a"})
+        if link is None and name_node is not None:
+            link = name_node.parent if name_node.parent is not None and name_node.parent.tag == "a" else None
+            link = link or _first(name_node, tags={"a"})
         href = link.attrs.get("href") if link else None
         name = clean_text(name_node.text() if name_node else (link.text() if link else None))
         if not href or not name:
-            errors.append("membership card missing profile link or name")
+            errors.append(f"membership card missing profile link or name: {name or '<unknown>'}")
             continue
         profile_url = canonicalize_url(urljoin(page_url, href))
-        title_node = _first(card, classes={"faculty-title", "person-title", "title"})
-        department_node = _first(card, classes={"faculty-department", "department"})
+        title_node = _first(card, classes={"entity_title", "faculty-title", "person-title", "title"})
+        department_node = _first(card, classes={"entity_department", "faculty-department", "department"})
+        department_label = (
+            _first(department_node, classes={"entity_detail_info_label"}) if department_node is not None else None
+        )
         role = clean_text(card.attrs.get("data-role"))
         key = clean_text(card.attrs.get("data-faculty-id")) or profile_url
         records.append(
@@ -141,7 +148,9 @@ def parse_directory_page(html: str, page_url: str) -> tuple[tuple[_DirectoryReco
                 profile_url=profile_url,
                 name=name,
                 title=clean_text(title_node.text()) if title_node else None,
-                department=clean_text(department_node.text()) if department_node else None,
+                department=clean_text((department_label or department_node).text().replace("\ufeff", ""))
+                if department_node
+                else None,
                 role=role,
             )
         )
@@ -151,9 +160,14 @@ def parse_directory_page(html: str, page_url: str) -> tuple[tuple[_DirectoryReco
     )
     for candidate in root.descendants():
         rel = set(candidate.attrs.get("rel", "").split())
-        if candidate.tag == "a" and ("next" in rel or "pagination-next" in candidate.classes):
+        if candidate.tag == "a" and (
+            "next" in rel or "pagination-next" in candidate.classes or "pagination_arrow_right" in candidate.classes
+        ):
             href = candidate.attrs.get("href")
-            disabled = candidate.attrs.get("aria-disabled", "false").casefold() == "true"
+            disabled = (
+                candidate.attrs.get("aria-disabled", "false").casefold() == "true"
+                or "pagination_arrow_disabled" in candidate.classes
+            )
             if disabled:
                 terminal_page_confirmed = True
             elif href:
@@ -168,11 +182,12 @@ def parse_directory_page(html: str, page_url: str) -> tuple[tuple[_DirectoryReco
 
 def parse_profile_page(html: str, directory: _DirectoryRecord) -> RawFacultyRecord:
     root = _parse(html)
-    name_node = _first(root, classes={"faculty-name", "person-name"}) or _first(root, tags={"h1"})
-    title_node = _first(root, classes={"faculty-title", "person-title", "title"})
+    name_node = _first(root, classes={"faculty-name", "person-name", "page_title"}) or _first(root, tags={"h1"})
+    title_node = _first(root, classes={"faculty-title", "person-title", "title", "page_description"})
     research_node = _first(root, classes={"research-interests", "research-summary", "research"})
-    biography_node = _first(root, classes={"biography", "bio"})
+    biography_node = _first(root, classes={"biography", "bio"}) or _first(root, classes={"page_content"})
     lab_description_node = _first(root, classes={"lab-description", "laboratory-description"})
+    department_node = _first(root, classes={"page_header_detail_nav_item_link_label"})
     area_nodes = [node for node in root.descendants() if node.classes.intersection({"research-area", "expertise"})]
     publication_nodes = [
         node for node in root.descendants() if node.classes.intersection({"known-publication", "publication-title"})
@@ -200,7 +215,8 @@ def parse_profile_page(html: str, directory: _DirectoryRecord) -> RawFacultyReco
         affiliations.append(
             RawAffiliation(
                 school="Whiting School of Engineering",
-                department=directory.department,
+                department=directory.department
+                or (clean_text(department_node.text().replace("\ufeff", "")) if department_node else None),
                 title=directory.title,
                 source_url=directory.profile_url,
             )
@@ -237,7 +253,7 @@ def parse_profile_page(html: str, directory: _DirectoryRecord) -> RawFacultyReco
             "lab_description": (clean_text(lab_description_node.text()) if lab_description_node else None),
             "lab_title": f"{name} — Lab",
             "known_publication_titles": [title for node in publication_nodes if (title := clean_text(node.text()))],
-            "profile_parse_version": "whiting-html-v1",
+            "profile_parse_version": "whiting-html-v2",
         },
     )
 
@@ -345,7 +361,7 @@ class WhitingFacultySource:
                                 profile_url=item.profile_url,
                                 source_role_category=item.role,
                                 eligibility_evidence=tuple(filter(None, (item.role, item.title, "directory listing"))),
-                                source_payload={"profile_error": str(exc), "profile_parse_version": "whiting-html-v1"},
+                                source_payload={"profile_error": str(exc), "profile_parse_version": "whiting-html-v2"},
                             )
                         )
                 page_url = next_url

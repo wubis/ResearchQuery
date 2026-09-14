@@ -6,7 +6,7 @@ from uuid import UUID
 
 from research_query.documents.builder import build_hopkins_documents
 from research_query.ingestion.faculty.base import FacultySource
-from research_query.ingestion.faculty.whiting import WhitingFacultySource, parse_directory_page
+from research_query.ingestion.faculty.whiting import WhitingFacultySource, parse_directory_page, parse_profile_page
 
 FIXTURES = Path(__file__).parent / "fixtures" / "whiting"
 
@@ -46,7 +46,34 @@ def test_whiting_satisfies_contract_and_parses_unicode_multi_affiliation(fixture
         "faculty_bio",
         "lab_description",
     }
-    assert jose.source_payload["profile_parse_version"] == "whiting-html-v1"
+    assert jose.source_payload["profile_parse_version"] == "whiting-html-v2"
+
+
+def test_live_directory_markup_parses_cards_and_reports_unlinked_member() -> None:
+    base = "https://engineering.jhu.edu/faculty/"
+    records, next_url, errors = parse_directory_page(_text("live-directory-1.html"), base)
+    assert len(records) == 9  # Ten observed cards; one lacks a profile link.
+    soumyadipta = next(record for record in records if record.name == "Soumyadipta Acharya")
+    assert soumyadipta.title == "Assistant Professor and Director of Bioengineering Innovation & Design"
+    assert soumyadipta.profile_url == "https://engineering.jhu.edu/faculty/soumyadipta-acharya"
+    assert next_url == "https://engineering.jhu.edu/faculty?current_page=2"
+    assert errors == ("membership card missing profile link or name: Amesh Adalja",)
+
+
+def test_live_terminal_page_and_profile_markup() -> None:
+    base = "https://engineering.jhu.edu/faculty/?current_page=2"
+    records, next_url, errors = parse_directory_page(_text("live-directory-last.html"), base)
+    assert len(records) == 2
+    assert next_url is None
+    assert errors == ()
+
+    directory, _, _ = parse_directory_page(_text("live-directory-1.html"), base)
+    soumyadipta = next(record for record in directory if record.name == "Soumyadipta Acharya")
+    profile = parse_profile_page(_text("live-profile.html"), soumyadipta)
+    assert profile.name == "Soumyadipta Acharya"
+    assert profile.title == "Assistant Professor and Director of Bioengineering Innovation & Design"
+    assert profile.affiliations[0].department == "Department of Biomedical Engineering"
+    assert profile.biography == "He leads biomedical design research at Hopkins."
 
 
 def test_directory_parse_error_for_zero_cards_marks_completeness_unknown() -> None:
